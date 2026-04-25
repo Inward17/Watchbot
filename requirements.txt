@@ -1,0 +1,10 @@
+python-telegram-bot==22.7
+motor==3.7.1
+pymongo==4.17.0
+groq==1.2.0
+requests==2.33.1
+google-api-python-client==2.194.0
+google-auth==2.49.2
+pillow==12.2.0
+python-dotenv==1.2.2
+yt-dlp==2026.3.17
