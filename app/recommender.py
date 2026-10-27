@@ -1,11 +1,12 @@
 from groq import Groq
 from app.tmdb import search_tmdb, get_details
+from app.vision import GROQ_MODEL, GROQ_REASONING
 import os
 from dotenv import load_dotenv
 
 load_dotenv()
 
-client = Groq(api_key=os.getenv("GROQ_API_KEY"))
+client = Groq(api_key=os.getenv("GROQ_API_KEY"), timeout=20)
 
 
 def get_ratings(titles: list) -> str:
@@ -44,10 +45,15 @@ User's watchlist:
 {watchlist_text}
 
 Rules:
-- Always give 2-3 specific recommendations with a one-line reason each. Never deflect.
-- If something is in-progress (status: watching), mention it and ask if they want to continue or try something new.
+- When the user wants recommendations, give 2-3 specific ones with a one-line reason each. Never deflect.
+- When the user asks about or is trying to identify a specific title, answer about that title only. Don't add extra recommendations or bring up their watchlist.
+- Only when recommending: if something is in-progress (status: watching), mention it and ask if they want to continue or try something new.
+- The app automatically sends a poster, summary and IMDb link right after your message for every title you bold. If the user asks for an image or picture, bold the title and say the poster is right below. Never say you can't send images.
+- Don't name actors, characters or plot details unless you are certain; if unsure, point to the IMDb link instead.
+- Never write URLs or IMDb ids yourself; the app adds the correct IMDb button under each poster.
 - Keep it short and fun. No long paragraphs.
 - Max one question per response.
+- Write every movie/series title in **bold**, using its official title. Bold nothing else.
 - Use the conversation history to stay in context."""
 
     messages = [{"role": "system", "content": system_prompt}]
@@ -56,8 +62,9 @@ Rules:
     messages.append({"role": "user", "content": user_message})
 
     response = client.chat.completions.create(
-        model="llama-3.1-8b-instant",
+        model=GROQ_MODEL,
         messages=messages,
-        max_tokens=300
+        max_tokens=600,
+        reasoning_effort=GROQ_REASONING,
     )
     return response.choices[0].message.content

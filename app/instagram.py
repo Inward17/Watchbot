@@ -1,11 +1,15 @@
 import yt_dlp
 from groq import Groq
+import logging
 import os
 from dotenv import load_dotenv
+from app.vision import clean_title, GROQ_MODEL, GROQ_REASONING
 
 load_dotenv()
 
-groq_client = Groq(api_key=os.getenv("GROQ_API_KEY"))
+logger = logging.getLogger(__name__)
+
+groq_client = Groq(api_key=os.getenv("GROQ_API_KEY"), timeout=20)
 
 
 def extract_reel_id(url: str) -> str:
@@ -20,6 +24,7 @@ def get_reel_info(url: str) -> dict:
         "quiet": True,
         "no_warnings": True,
         "skip_download": True,
+        "socket_timeout": 10,
     }
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -29,8 +34,8 @@ def get_reel_info(url: str) -> dict:
                 "description": info.get("description", ""),
                 "uploader":    info.get("uploader", ""),
             }
-    except Exception as e:
-        print(f"yt-dlp Instagram metadata error: {e}")
+    except Exception:
+        logger.exception("yt-dlp Instagram metadata error")
         return None
 
 
@@ -50,8 +55,9 @@ Examples of correct replies: "Reacher", "Interstellar", "Breaking Bad"
 If no movie/series found, reply: UNKNOWN"""
 
     response = groq_client.chat.completions.create(
-        model="llama-3.1-8b-instant",
+        model=GROQ_MODEL,
         messages=[{"role": "user", "content": prompt}],
-        max_tokens=50,
+        max_tokens=200,
+        reasoning_effort=GROQ_REASONING,
     )
-    return response.choices[0].message.content.strip()
+    return clean_title(response.choices[0].message.content)
