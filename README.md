@@ -155,6 +155,7 @@ watch_log  { user_id, tmdb_id, title, action, episodes, timestamp }
 Watchbot/
 ├── main.py                 # Entry point
 ├── requirements.txt
+├── LICENSE
 ├── test_helpers.py         # Checks for the parsing and formatting helpers
 └── app/
     ├── bot.py              # Telegram handlers, pick lists, poster cards
@@ -189,3 +190,7 @@ Runs plain `assert` checks for title cleanup, request routing, Markdown-to-HTML 
 - Conversation history is kept in memory, so it resets when the bot restarts.
 - The free OpenRouter vision model is rate limited; screenshot identification may occasionally fail.
 - Instagram may still block anonymous access for some reels even with an up-to-date yt-dlp.
+
+## License
+
+Released under the [MIT License](LICENSE).
