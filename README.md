@@ -41,13 +41,13 @@ All network calls (TMDB, Groq, OpenRouter, yt-dlp, ffmpeg) run off the event loo
 | Movie data and posters | [TMDB](https://www.themoviedb.org) API |
 | Video metadata and download | [yt-dlp](https://github.com/yt-dlp/yt-dlp) and ffmpeg |
 | Database | MongoDB Atlas, via Motor (async) |
-| Runtime | Python 3.11+ |
+| Runtime | Python 3.13+ |
 
 ## Getting started
 
 ### Prerequisites
 
-- Python 3.11 or newer
+- Python 3.13 or newer
 - [ffmpeg](https://ffmpeg.org/download.html) on your `PATH` (used for frame extraction)
   - Windows: download a build from ffmpeg.org and add its `bin` folder to `PATH`
   - macOS: `brew install ffmpeg`

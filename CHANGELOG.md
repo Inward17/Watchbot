@@ -12,6 +12,9 @@ All notable changes to WatchBot are listed here. The format follows [Keep a Chan
 - CI on every pull request: dependency install, syntax check and tests.
 - `main` is protected: changes land only through pull requests that pass CI.
 
+### Changed
+- Python 3.13 is now the supported version (was 3.11); CI tests on 3.13.
+
 ## [1.1.0] - 2026-10-29
 
 ### Added
