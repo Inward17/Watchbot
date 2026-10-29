@@ -1,6 +1,6 @@
 # WatchBot
 
-![Version](https://img.shields.io/github/v/release/Inward17/Watchbot) ![License](https://img.shields.io/badge/license-MIT-blue)
+![CI](https://github.com/Inward17/Watchbot/actions/workflows/ci.yml/badge.svg) ![Version](https://img.shields.io/github/v/release/Inward17/Watchbot) ![License](https://img.shields.io/badge/license-MIT-blue)
 
 A Telegram bot that keeps track of the movies and series you want to watch. Send it a YouTube Short, an Instagram Reel, a screenshot or just a title, and it identifies the show, confirms it against TMDB and adds it to your watchlist. It also tracks episode progress and gives conversational recommendations with posters and IMDb links.
 
@@ -182,6 +182,7 @@ Watchbot/
 ├── requirements.txt
 ├── LICENSE
 ├── CHANGELOG.md            # Release notes per version
+├── .github/workflows/ci.yml  # Tests every pull request
 ├── test_helpers.py         # Checks for the parsing and formatting helpers
 └── app/
     ├── __init__.py         # __version__
@@ -221,6 +222,14 @@ Runs plain `assert` checks for title cleanup, request routing, Markdown-to-HTML 
 - The free OpenRouter vision model is rate limited; screenshot identification may occasionally fail.
 - Instagram may still block anonymous access for some reels even with an up-to-date yt-dlp.
 
+## Contributing
+
+`main` is protected. Nobody, including admins, can push to it directly; every change goes through a pull request.
+
+1. Create a branch, commit, push it and open a pull request against `main`.
+2. [CI](.github/workflows/ci.yml) installs the dependencies, checks the syntax and runs `test_helpers.py`. The pull request can't be merged until it passes and the branch is up to date with `main`.
+3. The maintainer reviews and merges by hand. Auto-merge is off.
+
 ## Versioning and releases
 
 WatchBot follows [Semantic Versioning](https://semver.org/). The version lives in [`app/__init__.py`](app/__init__.py).
@@ -229,7 +238,7 @@ To cut a release:
 
 1. Bump `__version__` in `app/__init__.py`.
 2. Move the notes into a new section in [CHANGELOG.md](CHANGELOG.md) and add its compare link.
-3. Merge to `main`, then tag and publish:
+3. Open a pull request, wait for CI, merge it, then tag and publish:
 
 ```bash
 git tag -a v1.2.0 -m "v1.2.0"
