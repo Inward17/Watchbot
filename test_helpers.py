@@ -1,5 +1,6 @@
 from app.vision import clean_title
-from app.bot import is_open_request, md_to_html, titles_in, same_title
+from app.bot import is_open_request, md_to_html, titles_in, same_title, match_items, providers_line
+from app.recommender import watchlist_summary
 
 # Run: python test_helpers.py  (or pytest)
 
@@ -49,10 +50,42 @@ def test_same_title():
     assert not same_title("A Modern Family", "Modern Family")
 
 
+def test_match_items():
+    items = [{"title": "The Dark Knight"}, {"title": "Dark"}, {"title": "Dark Matter"}, {"title": "Reacher"}]
+    assert match_items(items, "dark") == [{"title": "Dark"}]  # exact beats substring
+    assert [i["title"] for i in match_items(items, "dark m")] == ["Dark Matter"]
+    assert [i["title"] for i in match_items(items, "knight")] == ["The Dark Knight"]
+    assert len(match_items([{"title": "Dark Matter"}, {"title": "The Dark Knight"}], "dark")) == 2  # ask which
+    assert match_items(items, "severance") == []
+
+
+def test_providers_line():
+    p = lambda *names: [{"provider_name": n} for n in names]
+    assert providers_line({"flatrate": p("Netflix", "Prime Video"), "ads": p("Netflix", "MX Player")}) == \
+        "📺 Netflix, Prime Video, MX Player"
+    assert providers_line({"rent": p("Apple TV"), "buy": p("Apple TV", "Google Play")}) == "💳 Rent/buy: Apple TV, Google Play"
+    assert providers_line({"flatrate": p("Amazon Prime Video", "Apple TV", "Apple TV Amazon Channel"),
+                           "ads": p("Amazon Prime Video with Ads")}) == "📺 Amazon Prime Video, Apple TV"
+    assert providers_line({}) == ""
+
+
+def test_watchlist_summary():
+    items = [
+        {"title": "Old", "type": "movie", "status": "completed", "added_at": "2026-01-01"},
+        {"title": "Dark", "type": "tv", "status": "watching", "episodes_watched": 12, "last_updated": "2026-10-01"},
+    ]
+    assert watchlist_summary(items) == "- Dark (tv): watching, ep 12\n- Old (movie): completed"
+    assert watchlist_summary(items, limit=1) == "- Dark (tv): watching, ep 12\n(+1 older titles)"
+    assert watchlist_summary([]) == "Empty watchlist"
+
+
 if __name__ == "__main__":
     test_clean_title()
     test_is_open_request()
     test_md_to_html()
     test_titles_in()
     test_same_title()
+    test_match_items()
+    test_providers_line()
+    test_watchlist_summary()
     print("ok")

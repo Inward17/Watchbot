@@ -1,12 +1,9 @@
 from googleapiclient.discovery import build
-from groq import Groq
 import os, re
 from dotenv import load_dotenv
-from app.vision import clean_title, GROQ_MODEL, GROQ_REASONING
+from app.vision import clean_title, groq_chat
 
 load_dotenv()
-
-groq_client = Groq(api_key=os.getenv("GROQ_API_KEY"), timeout=20)
 
 def extract_video_id(url: str) -> str:
     patterns = [
@@ -51,10 +48,5 @@ Based on ALL of the above information, extract the movie or TV series name being
 Reply with ONLY the movie/series name, nothing else.
 If you absolutely cannot identify any specific movie or series, reply with "UNKNOWN"."""
 
-    response = groq_client.chat.completions.create(
-        model=GROQ_MODEL,
-        messages=[{"role": "user", "content": prompt}],
-        max_tokens=200,
-        reasoning_effort=GROQ_REASONING,
-    )
+    response = groq_chat(messages=[{"role": "user", "content": prompt}], max_tokens=200)
     return clean_title(response.choices[0].message.content)

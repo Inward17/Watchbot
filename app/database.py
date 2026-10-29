@@ -24,6 +24,9 @@ def check_connection():
         # Sync client: the bot's event loop doesn't exist yet, and Motor must stay bound to that loop
         with MongoClient(MONGO_URI, serverSelectionTimeoutMS=5000) as sync_client:
             sync_client.admin.command("ping")
+            # No-ops when they exist. The unique one stops a double-tapped Add from saving a title twice
+            sync_client.watchbot.watchlist.create_index([("user_id", 1), ("tmdb_id", 1)], unique=True)
+            sync_client.watchbot.watch_log.create_index([("user_id", 1), ("timestamp", -1)])
     except Exception as e:
         sys.exit(
             f"ERROR: Can't reach MongoDB: {e}\n"

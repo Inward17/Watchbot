@@ -1,5 +1,6 @@
 import requests
 import base64
+from groq import Groq, RateLimitError
 import logging
 import os
 from dotenv import load_dotenv
@@ -14,11 +15,24 @@ VISION_MODEL = "google/gemma-3-12b-it:free"
 # qwen3.8-27b (tested 2026-10-28). It's a reasoning model and its thinking counts toward max_tokens,
 # so callers pass GROQ_REASONING and leave headroom.
 GROQ_MODEL = "openai/gpt-oss-120b"
+GROQ_FALLBACK_MODEL = "openai/gpt-oss-20b"  # separate per-minute token cap on Groq's free tier
 GROQ_REASONING = "low"
+# One retry covers dropped connections; on 429 we switch models instead of waiting out the cap
+groq_client = Groq(api_key=os.getenv("GROQ_API_KEY"), timeout=20, max_retries=1)
 REFUSAL_PREFIXES = (
     "i cannot", "i can't", "i'm unable", "i am unable", "i'm sorry", "i am sorry",
     "sorry,", "unable to", "cannot ", "not sure", "there is no", "no movie",
 )
+
+
+def groq_chat(**kwargs):
+    """Chat completion on GROQ_MODEL, falling back to GROQ_FALLBACK_MODEL when the free tier's
+    tokens-per-minute cap is hit. Raises RateLimitError only if both are capped."""
+    try:
+        return groq_client.chat.completions.create(model=GROQ_MODEL, reasoning_effort=GROQ_REASONING, **kwargs)
+    except RateLimitError:
+        logger.warning("%s rate limited, falling back to %s", GROQ_MODEL, GROQ_FALLBACK_MODEL)
+        return groq_client.chat.completions.create(model=GROQ_FALLBACK_MODEL, reasoning_effort=GROQ_REASONING, **kwargs)
 
 
 def clean_title(raw: str) -> str:

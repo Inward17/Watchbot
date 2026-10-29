@@ -45,3 +45,6 @@ desktop.ini
 *.jpeg
 *.png
 test_output.txt
+
+# Bot state (chat history), written by PicklePersistence
+bot_data.pickle
