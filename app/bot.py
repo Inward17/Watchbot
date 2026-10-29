@@ -1,12 +1,16 @@
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto
+from telegram.constants import ChatAction
 from telegram.helpers import escape_markdown
 from telegram.ext import (
-    Application, CommandHandler, MessageHandler,
-    CallbackQueryHandler, filters, ContextTypes
+    Application, CommandHandler, MessageHandler, ApplicationHandlerStop,
+    CallbackQueryHandler, TypeHandler, PicklePersistence, filters, ContextTypes
 )
+from groq import RateLimitError
+from pymongo.errors import DuplicateKeyError
 from app.database import watchlist_collection, watch_log_collection, check_connection
 from app.tmdb import search_tmdb, get_details
 from app.recommender import get_recommendation
+from app import __version__
 from dotenv import load_dotenv
 from datetime import datetime, timezone
 import asyncio
@@ -23,10 +27,30 @@ load_dotenv()
 
 logger = logging.getLogger(__name__)
 
+# Telegram user ids allowed to use the bot, comma-separated. Empty = anyone (and anyone burns your API quotas)
+ALLOWED_USERS = {int(u) for u in os.getenv("ALLOWED_USERS", "").replace(" ", "").split(",") if u}
+WATCH_REGION = os.getenv("WATCH_REGION", "IN")  # country for "where to watch", ISO 3166-1 code
+BUSY_TEXT = "😮‍💨 I'm getting too many requests right now. Give me a minute and try again!"
+
+COMMANDS = [
+    ("add", "Search and add a title"),
+    ("list", "Show your watchlist"),
+    ("watched", "Log episodes: /watched <title> <n>"),
+    ("done", "Mark a title completed"),
+    ("hold", "Put a title on hold"),
+    ("delete", "Remove a title"),
+    ("recommend", "Get a recommendation"),
+    ("start", "Help"),
+]
+
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
 def get_user_id(update: Update) -> int:
     return update.effective_user.id
+
+
+async def get_watchlist(user_id: int) -> list:
+    return await watchlist_collection.find({"user_id": user_id}).to_list(None)
 
 
 def esc(text) -> str:
@@ -78,6 +102,30 @@ def same_title(a: str, b: str) -> bool:
     return norm(a) == norm(b)
 
 
+def match_items(items: list, query: str) -> list:
+    """Watchlist items the user means by `query`. An exact title wins ("dark" is Dark, not The Dark Knight);
+    otherwise every title containing the query, so the caller can ask which one."""
+    exact = [i for i in items if same_title(i["title"], query)]
+    return exact or [i for i in items if query.lower().strip() in i["title"].lower()]
+
+
+def providers_line(region: dict) -> str:
+    """'📺 Netflix, Prime Video' from one country's TMDB watch/providers entry; rent/buy only if nothing streams it."""
+    def names(*kinds):
+        seen = []
+        for kind in kinds:
+            for p in region.get(kind, []):
+                # Skip variants of a service already listed ("Amazon Prime Video with Ads", "Apple TV Amazon Channel")
+                if not any(p["provider_name"].startswith(s) for s in seen):
+                    seen.append(p["provider_name"])
+        return seen[:3]
+    if streaming := names("flatrate", "free", "ads"):
+        return "📺 " + ", ".join(streaming)
+    if paid := names("rent", "buy"):
+        return "💳 Rent/buy: " + ", ".join(paid)
+    return ""
+
+
 def lookup_title(title: str):
     """Exact-name TMDB match that has a poster, plus its IMDb id. None when nothing matches exactly,
     so a wrong show ("A Modern Family") or a bold label never becomes a card. Blocking — run in a thread."""
@@ -96,12 +144,13 @@ def lookup_title(title: str):
     if not matches:
         return None
     r = matches[0]
-    details = get_details(r["id"], r["media_type"], append="external_ids")
-    return r, details.get("external_ids", {}).get("imdb_id")
+    details = get_details(r["id"], r["media_type"], append="external_ids,watch/providers")
+    region = details.get("watch/providers", {}).get("results", {}).get(WATCH_REGION, {})
+    return r, details.get("external_ids", {}).get("imdb_id"), providers_line(region)
 
 
 async def send_title_cards(message, response: str, watchlist: list):
-    """After an AI reply: up to 5 poster cards with Add and IMDb buttons, skipping titles already on the watchlist."""
+    """After an AI reply: up to 3 poster cards with Add and IMDb buttons, skipping titles already on the watchlist."""
     try:
         found = await asyncio.gather(
             *(asyncio.to_thread(lookup_title, t) for t in titles_in(response)), return_exceptions=True
@@ -110,12 +159,14 @@ async def send_title_cards(message, response: str, watchlist: list):
         if len(hits) > 1:  # a list of picks: skip what's already on the watchlist. One title = the user asked about it
             on_list = {item["tmdb_id"] for item in watchlist}
             hits = [h for h in hits if h[0]["id"] not in on_list]
-        for r, imdb_id in hits[:5]:
+        for r, imdb_id, where in hits[:3]:
             name = r.get("title") or r.get("name", "Unknown")
             year = (r.get("release_date") or r.get("first_air_date") or "")[:4]
             caption = f"<b>{html.escape(name, quote=False)}</b>" + (f" ({year})" if year else "") + f" · {r['media_type'].upper()}"
             if r.get("vote_average"):
                 caption += f" · ⭐ {r['vote_average']:.1f}"
+            if where:
+                caption += f"\n{html.escape(where, quote=False)} <i>(JustWatch)</i>"
             overview = r.get("overview", "")
             if overview:
                 caption += "\n\n" + html.escape(overview[:300] + ("…" if len(overview) > 300 else ""), quote=False)
@@ -240,9 +291,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/recommend — Get a recommendation\n"
         "/delete <title> — Remove from list\n\n"
         "*You can also:*\n"
-        "📎 Send a YouTube / Shorts link\n"
+        "📎 Send a YouTube, Shorts or Instagram Reel link\n"
         "📸 Send a screenshot from a movie\n"
-        "💬 Just chat naturally!",
+        "💬 Just chat: \"something like Dark\", \"where can I watch Severance?\"\n\n"
+        f"_WatchBot v{__version__}_",
         parse_mode="Markdown"
     )
 
@@ -273,7 +325,7 @@ async def list_watchlist(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "completed":     "✅",
     }
     try:
-        items = await watchlist_collection.find({"user_id": user_id}).to_list(100)
+        items = await get_watchlist(user_id)
         if not items:
             await update.message.reply_text("Your watchlist is empty. Use /add to get started!")
             return
@@ -291,112 +343,94 @@ async def list_watchlist(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⚠️ Couldn't fetch your watchlist right now.")
 
 
-async def watched(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if len(context.args) < 2:
-        await update.message.reply_text("Usage: /watched <title> <episodes>")
-        return
+async def apply_action(user_id: int, item: dict, action: str, episodes: int = 0) -> str:
+    """Apply a watchlist change, log it, and return the Markdown reply.
+    action: "progress" (add `episodes`), "completed", "on_hold" or "removed"."""
+    title, now = item["title"], datetime.now(timezone.utc)
+    if action == "removed":
+        await watchlist_collection.delete_one({"_id": item["_id"]})
+        await log_watch_event(user_id, item["tmdb_id"], title, action)
+        return f"🗑️ Removed *{esc(title)}* from your watchlist."
+
+    changes = {"last_updated": now}
+    if action == "progress":
+        new_count = item.get("episodes_watched", 0) + episodes
+        status = "completed" if (item.get("total_episodes") and new_count >= item["total_episodes"]) else "watching"
+        changes.update(episodes_watched=new_count, status=status)
+        if status == "completed":
+            changes["completed_at"] = now
+        reply = f"✅ Updated! *{esc(title)}* — {new_count} episodes watched. Status: {status}"
+    elif action == "completed":
+        changes.update(status="completed", completed_at=now)
+        reply = f"🎉 Marked *{esc(title)}* as completed!"
+    else:
+        changes["status"] = "on_hold"
+        reply = f"⏸️ Put *{esc(title)}* on hold at episode {item.get('episodes_watched', 0)}. I'll remember where you left off!"
+    await watchlist_collection.update_one({"_id": item["_id"]}, {"$set": changes})
+    await log_watch_event(user_id, item["tmdb_id"], title, action, episodes)
+    return reply
+
+
+async def act_on_title(message, user_id: int, items: list, query: str, action: str, episodes: int = 0) -> bool:
+    """Run `action` on the watchlist title the user named. Several matches → "Which one?" buttons.
+    Returns False when nothing matches, so callers can reply or fall through to the AI."""
+    matches = match_items(items, query)
+    if not matches:
+        return False
+    if len(matches) > 1:
+        await message.reply_text("Which one?", reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton(i["title"], callback_data=f"act_{action}_{episodes}_{i['tmdb_id']}")]
+            for i in matches[:8]
+        ]))
+        return True
+    await message.reply_text(await apply_action(user_id, matches[0], action, episodes), parse_mode="Markdown")
+    return True
+
+
+async def title_command(update: Update, query: str, action: str, episodes: int = 0):
+    """Shared body of /watched, /done, /hold and /delete."""
     try:
-        episodes = int(context.args[-1])
-        title_query = " ".join(context.args[:-1]).lower()
-    except ValueError:
-        await update.message.reply_text("Usage: /watched <title> <number of episodes>")
-        return
-    user_id = get_user_id(update)
-    try:
-        items = await watchlist_collection.find({"user_id": user_id}).to_list(100)
-        match = next((i for i in items if title_query in i["title"].lower()), None)
-        if not match:
-            await update.message.reply_text(f"Couldn't find '{title_query}' in your watchlist.")
-            return
-        new_count = match.get("episodes_watched", 0) + episodes
-        status = "completed" if (match.get("total_episodes") and new_count >= match["total_episodes"]) else "watching"
-        await watchlist_collection.update_one(
-            {"_id": match["_id"]},
-            {"$set": {"episodes_watched": new_count, "status": status, "last_updated": datetime.now(timezone.utc)}}
-        )
-        await log_watch_event(user_id, match["tmdb_id"], match["title"], "progress", episodes)
-        await update.message.reply_text(
-            f"✅ Updated! *{esc(match['title'])}* — {new_count} episodes watched. Status: {status}",
-            parse_mode="Markdown"
-        )
+        user_id = get_user_id(update)
+        items = await get_watchlist(user_id)
+        if not await act_on_title(update.message, user_id, items, query, action, episodes):
+            await update.message.reply_text(f"Couldn't find '{query}' in your watchlist.")
     except Exception:
         logger.exception("Handler error")
-        await update.message.reply_text("⚠️ Couldn't update progress. Try again.")
+        await update.message.reply_text("⚠️ Couldn't update your watchlist. Try again.")
+
+
+async def watched(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if len(context.args) < 2 or not context.args[-1].isdigit():
+        await update.message.reply_text("Usage: /watched <title> <number of episodes>")
+        return
+    await title_command(update, " ".join(context.args[:-1]), "progress", int(context.args[-1]))
 
 
 async def done(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
         await update.message.reply_text("Usage: /done <title>")
         return
-    title_query = " ".join(context.args).lower()
-    user_id = get_user_id(update)
-    try:
-        items = await watchlist_collection.find({"user_id": user_id}).to_list(100)
-        match = next((i for i in items if title_query in i["title"].lower()), None)
-        if not match:
-            await update.message.reply_text(f"Couldn't find '{title_query}' in your watchlist.")
-            return
-        await watchlist_collection.update_one(
-            {"_id": match["_id"]},
-            {"$set": {"status": "completed", "completed_at": datetime.now(timezone.utc)}}
-        )
-        await log_watch_event(user_id, match["tmdb_id"], match["title"], "completed")
-        await update.message.reply_text(f"🎉 Marked *{esc(match['title'])}* as completed!", parse_mode="Markdown")
-    except Exception:
-        logger.exception("Handler error")
-        await update.message.reply_text("⚠️ Couldn't update status. Try again.")
+    await title_command(update, " ".join(context.args), "completed")
 
 
 async def hold(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
         await update.message.reply_text("Usage: /hold <title>")
         return
-    title_query = " ".join(context.args).lower()
-    user_id = get_user_id(update)
-    try:
-        items = await watchlist_collection.find({"user_id": user_id}).to_list(100)
-        match = next((i for i in items if title_query in i["title"].lower()), None)
-        if not match:
-            await update.message.reply_text(f"Couldn't find '{title_query}' in your watchlist.")
-            return
-        await watchlist_collection.update_one(
-            {"_id": match["_id"]},
-            {"$set": {"status": "on_hold"}}
-        )
-        await log_watch_event(user_id, match["tmdb_id"], match["title"], "on_hold")
-        ep = match.get("episodes_watched", 0)
-        await update.message.reply_text(
-            f"⏸️ Put *{esc(match['title'])}* on hold at episode {ep}. I'll remember where you left off!",
-            parse_mode="Markdown"
-        )
-    except Exception:
-        logger.exception("Handler error")
-        await update.message.reply_text("⚠️ Couldn't update status. Try again.")
+    await title_command(update, " ".join(context.args), "on_hold")
 
 
 async def delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
         await update.message.reply_text("Usage: /delete <title>")
         return
-    title_query = " ".join(context.args).lower()
-    user_id = get_user_id(update)
-    try:
-        items = await watchlist_collection.find({"user_id": user_id}).to_list(100)
-        match = next((i for i in items if title_query in i["title"].lower()), None)
-        if not match:
-            await update.message.reply_text(f"Couldn't find '{title_query}' in your watchlist.")
-            return
-        await watchlist_collection.delete_one({"_id": match["_id"]})
-        await update.message.reply_text(f"🗑️ Removed *{esc(match['title'])}* from your watchlist.", parse_mode="Markdown")
-    except Exception:
-        logger.exception("Handler error")
-        await update.message.reply_text("⚠️ Couldn't remove from watchlist. Try again.")
+    await title_command(update, " ".join(context.args), "removed")
 
 
 async def recommend(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = get_user_id(update)
     try:
-        items = await watchlist_collection.find({"user_id": user_id}).to_list(100)
+        items = await get_watchlist(user_id)
         in_progress = [i for i in items if i["status"] == "watching"]
 
         if in_progress:
@@ -448,28 +482,41 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             genres = [g["name"] for g in details.get("genres", [])]
             total_episodes = details.get("number_of_episodes")
 
-            existing = await watchlist_collection.find_one({"user_id": user_id, "tmdb_id": int(tmdb_id)})
-            if existing:
+            try:
+                await watchlist_collection.insert_one({
+                    "user_id":          user_id,
+                    "tmdb_id":          int(tmdb_id),
+                    "title":            title,
+                    "type":             media_type,
+                    "status":           "plan_to_watch",
+                    "episodes_watched": 0,
+                    "total_episodes":   total_episodes,
+                    "genres":           genres,
+                    "added_from":       added_from,
+                    "added_at":         datetime.now(timezone.utc),
+                })
+            except DuplicateKeyError:  # unique (user_id, tmdb_id) index
                 await say(f"'{title}' is already in your watchlist!")
                 return
-
-            await watchlist_collection.insert_one({
-                "user_id":          user_id,
-                "tmdb_id":          int(tmdb_id),
-                "title":            title,
-                "type":             media_type,
-                "status":           "plan_to_watch",
-                "episodes_watched": 0,
-                "total_episodes":   total_episodes,
-                "genres":           genres,
-                "added_from":       added_from,
-                "added_at":         datetime.now(timezone.utc),
-            })
             await log_watch_event(user_id, int(tmdb_id), title, "added")
             await say(f"✅ Added '{title}' to your watchlist!")
         except Exception:
             logger.exception("Handler error")
             await say("⚠️ Something went wrong adding that. Try again.")
+
+    # ── "Which one?" pick after an ambiguous /done, /hold, /delete or progress update ──
+    elif data.startswith("act_"):
+        prefix, episodes, tmdb_id = data.rsplit("_", 2)  # "act_on_hold_0_1234"
+        try:
+            item = await watchlist_collection.find_one({"user_id": user_id, "tmdb_id": int(tmdb_id)})
+            if item:
+                await query.edit_message_text(
+                    await apply_action(user_id, item, prefix[len("act_"):], int(episodes)), parse_mode="Markdown")
+            else:
+                await query.edit_message_text("That title isn't in your watchlist anymore.")
+        except Exception:
+            logger.exception("Handler error")
+            await query.edit_message_text("⚠️ Couldn't update your watchlist. Try again.")
 
     # ── Continue an in-progress show ──
     elif data.startswith("rec_continue_"):
@@ -497,14 +544,17 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         genre = data.split("_", 1)[1]
         mood_msg = f"Surprise me with something great" if genre == "Any" else f"Recommend something in {genre}"
         try:
-            items = await watchlist_collection.find({"user_id": user_id}).to_list(100)
+            items = await get_watchlist(user_id)
             await query.edit_message_text("🤔 Thinking...")
+            await query.message.chat.send_action(ChatAction.TYPING)
             history = context.user_data.get("history", [])
             response = await asyncio.to_thread(get_recommendation, items, mood_msg, history)
             append_history(context, "user", mood_msg)
             append_history(context, "assistant", response)
             await query.edit_message_text(md_to_html(response), parse_mode="HTML")
             await send_title_cards(query.message, response, items)
+        except RateLimitError:
+            await query.edit_message_text(BUSY_TEXT)
         except Exception:
             logger.exception("Handler error")
             await query.edit_message_text("⚠️ AI is having a moment. Try again soon!")
@@ -621,7 +671,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await offer_matches(update, context, update.message.text.strip())
             return
 
-        items = await watchlist_collection.find({"user_id": user_id}).to_list(100)
+        items = await get_watchlist(user_id)
 
         # ── Progress update: "watched 5 episodes of Dark" ──
         patterns = [
@@ -639,52 +689,19 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 else:
                     title_query, episodes = g[0].strip(), int(g[1])
 
-                db_match = next((i for i in items if title_query in i["title"].lower()), None)
-                if db_match:
-                    new_count = db_match.get("episodes_watched", 0) + episodes
-                    status = "completed" if (db_match.get("total_episodes") and new_count >= db_match["total_episodes"]) else "watching"
-                    await watchlist_collection.update_one(
-                        {"_id": db_match["_id"]},
-                        {"$set": {"episodes_watched": new_count, "status": status, "last_updated": datetime.now(timezone.utc)}}
-                    )
-                    await log_watch_event(user_id, db_match["tmdb_id"], db_match["title"], "progress", episodes)
-                    await update.message.reply_text(
-                        f"✅ Got it! *{esc(db_match['title'])}* updated — {new_count} episodes watched. Status: {status}",
-                        parse_mode="Markdown"
-                    )
-                else:
+                if not await act_on_title(update.message, user_id, items, title_query, "progress", episodes):
                     await update.message.reply_text("Couldn't find that title in your watchlist. Use /add to add it first.")
                 return
 
-        # ── Mark completed: "finished Dark" ──
-        done_m = re.search(r"(finished|completed|done watching)\s+(.+)", text)
-        if done_m:
-            title_query = done_m.group(2).strip()
-            db_match = next((i for i in items if title_query in i["title"].lower()), None)
-            if db_match:
-                await watchlist_collection.update_one(
-                    {"_id": db_match["_id"]},
-                    {"$set": {"status": "completed", "completed_at": datetime.now(timezone.utc)}}
-                )
-                await log_watch_event(user_id, db_match["tmdb_id"], db_match["title"], "completed")
-                await update.message.reply_text(f"🎉 Marked *{esc(db_match['title'])}* as completed!", parse_mode="Markdown")
-                return
+        # ── Mark completed: "finished Dark". No watchlist match → it's chat, let the AI answer ──
+        done_m = re.search(r"\b(finished|completed|done watching)\s+(.+)", text)
+        if done_m and await act_on_title(update.message, user_id, items, done_m.group(2).strip(), "completed"):
+            return
 
         # ── Put on hold: "hold Dark" / "put Dark on hold" ──
-        hold_m = re.search(r"(hold|pause|break|bored|stop watching)\s+(.+)|put\s+(.+?)\s+on\s+hold", text)
-        if hold_m:
-            title_query = (hold_m.group(2) or hold_m.group(3) or "").strip()
-            db_match = next((i for i in items if title_query in i["title"].lower()), None)
-            if db_match:
-                await watchlist_collection.update_one(
-                    {"_id": db_match["_id"]}, {"$set": {"status": "on_hold"}}
-                )
-                await log_watch_event(user_id, db_match["tmdb_id"], db_match["title"], "on_hold")
-                await update.message.reply_text(
-                    f"⏸️ Put *{esc(db_match['title'])}* on hold. I'll remember where you left off!",
-                    parse_mode="Markdown"
-                )
-                return
+        hold_m = re.search(r"\b(hold|pause|break from|bored of|stop watching)\s+(.+)|\bput\s+(.+?)\s+on\s+hold", text)
+        if hold_m and await act_on_title(update.message, user_id, items, (hold_m.group(2) or hold_m.group(3)).strip(), "on_hold"):
+            return
 
         # ── Quick-add: "add Dark" ──
         add_m = re.search(r"^add\s+(.+)", text)
@@ -704,6 +721,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         # ── Default: AI conversation with history ──
+        await update.message.chat.send_action(ChatAction.TYPING)
         history = context.user_data.get("history", [])
         response = await asyncio.to_thread(get_recommendation, items, update.message.text, history)
         append_history(context, "user", update.message.text)
@@ -711,6 +729,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(md_to_html(response), parse_mode="HTML")
         await send_title_cards(update.message, response, items)
 
+    except RateLimitError:
+        await update.message.reply_text(BUSY_TEXT)
     except Exception:
         logger.exception("Handler error")
         await update.message.reply_text("⚠️ Something went wrong. Try again!")
@@ -718,11 +738,38 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ── App setup ─────────────────────────────────────────────────────────────────
 
+async def gate(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Runs before every handler: drop updates from users not in ALLOWED_USERS."""
+    user = update.effective_user
+    if not ALLOWED_USERS or (user and user.id in ALLOWED_USERS):
+        return
+    logger.warning("Blocked user %s (add to ALLOWED_USERS to allow)", user and user.id)
+    if update.callback_query:
+        await update.callback_query.answer("This bot is private.")
+    elif update.effective_message:
+        await update.effective_message.reply_text("🔒 This is a private bot.")
+    raise ApplicationHandlerStop
+
+
+async def post_init(app: Application):
+    await app.bot.set_my_commands(COMMANDS)  # fills Telegram's "/" menu
+
+
 def run_bot():
     logging.basicConfig(format="%(asctime)s %(levelname)s %(name)s: %(message)s", level=logging.INFO)
     logging.getLogger("httpx").setLevel(logging.WARNING)  # PTB logs every poll otherwise
     check_connection()
-    app =Application.builder().token(os.getenv("TELEGRAM_BOT_TOKEN")).build()
+    if not ALLOWED_USERS:
+        logger.warning("ALLOWED_USERS is empty: anyone who finds the bot can use it and your API quotas")
+    app = (
+        Application.builder()
+        .token(os.getenv("TELEGRAM_BOT_TOKEN"))
+        .persistence(PicklePersistence(filepath="bot_data.pickle"))  # chat history survives restarts
+        .post_init(post_init)
+        .build()
+    )
+
+    app.add_handler(TypeHandler(Update, gate), group=-1)
 
     app.add_handler(CommandHandler("start",    start))
     app.add_handler(CommandHandler("add",      add))
@@ -742,5 +789,5 @@ def run_bot():
     app.add_handler(MessageHandler(filters.PHOTO, handle_image))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    print("🤖 WatchBot is running...")
+    print(f"🤖 WatchBot v{__version__} is running...")
     app.run_polling()
